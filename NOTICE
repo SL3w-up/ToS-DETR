@@ -1,0 +1,25 @@
+ToS-DETR
+
+This project adapts Deformable DETR for 2.5D costal cartilage fracture detection.
+The ToS-DETR modifications, medical input pipeline, training schedule,
+external inference utilities, and project documentation are provided by the
+ToS-DETR contributors unless otherwise noted.
+
+Portions of this repository are derived from:
+
+- Deformable DETR
+  Copyright (c) 2020 SenseTime. All Rights Reserved.
+  Licensed under the Apache License, Version 2.0.
+  Upstream: https://github.com/fundamentalvision/Deformable-DETR
+
+- DETR
+  Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
+  Licensed under the Apache License, Version 2.0.
+  Upstream: https://github.com/facebookresearch/detr
+
+- Multi-scale deformable attention CUDA operators adapted from the Deformable DETR
+  release and its cited upstream operator sources.
+
+This repository may use masks produced by external segmentation tools, including
+TotalSegmentator or local segmentation pipelines. Those tools, models, and their
+weights are not redistributed here and remain subject to their own licenses.

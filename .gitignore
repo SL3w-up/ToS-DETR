@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+models/ops/build/
+
+# Data, checkpoints, and experiment outputs
+data/
+outputs/
+output/
+exps/
+pretrained/
+checkpoints/
+weights/
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.onnx
+*.engine
+
+# Logs and generated reports
+*.log
+*.out
+*.err
+*.pid
+*.csv
+*.xlsx
+*.jsonl
+summary.json
+case_predictions.json
+slice_summaries.jsonl
+predicted_positive_cases.txt
+positive_cases.txt
+predicted_negative_cases.txt
+negative_cases.txt
+positive_case_images_manifest.json
+positive_case_labels_manifest.json
+positive_case_images/
+positive_case_labels/
+threshold_filtered_case_boxes.json
+
+# Local environment
+.env
+.venv/
+venv/
+env/
+*.local
