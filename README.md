@@ -1,6 +1,8 @@
 # ToS-DETR
 
-**An ROI- and continuity-aware 2.5D deformable Transformer framework for costal cartilage fracture detection.**
+**An anotomy structure- and spatial continuity-aware model for costal cartilage fracture detection.**
+
+ToS-DETR adapts deformable transformer framework to ROI-constrained costal cartilage fracture detection on 2.5D CT slices.
 
 This repository contains the model, training/evaluation code, external inference utility, and a notebook demo for a single external case-style inference workflow.
 
