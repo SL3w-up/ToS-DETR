@@ -155,7 +155,7 @@ def prepare_for_aggregation(item):
     converted = dict(item)
     if "box" in converted:
         converted["box"] = torch.as_tensor(converted["box"], dtype=torch.float32)
-    for key in ("score", "organ_score", "uncertainty", "certainty"):
+    for key in ("score", "organ_score"):
         if key in converted:
             converted[key] = float(converted[key])
     return converted
@@ -489,6 +489,7 @@ def main():
     ckpt_args.backbone_pretrained = False
     ckpt_args.backbone_pretrained_path = ""
     ckpt_args.pretrained_model = ""
+    model_state = checkpoint["model"]
 
     transform = coco_dataset.make_coco_transforms("val", ckpt_args)
     dataset = ExternalOrganMaskDataset(args.image_dir, args.mask_dir, transform, max_images=args.max_images)
@@ -504,7 +505,7 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
     torch.backends.cudnn.benchmark = True
     model, _, postprocessors = build_model(ckpt_args)
-    model.load_state_dict(checkpoint["model"], strict=True)
+    model.load_state_dict(model_state, strict=True)
     model.to(device)
     model.eval()
     fracture_post = postprocessors["fracture"]

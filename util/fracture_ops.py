@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 
 
-SAMPLE_TYPE_ORDER = ("P", "PN", "HN", "N")
+SAMPLE_TYPE_ORDER = ("P", "PN", "N")
 SAMPLE_TYPE_TO_ID = {name: idx for idx, name in enumerate(SAMPLE_TYPE_ORDER)}
 UNKNOWN_SAMPLE_TYPE = "UNKNOWN"
 UNKNOWN_SAMPLE_TYPE_ID = -1
@@ -20,15 +20,6 @@ def normalize_sample_type(value, annotations: Optional[Sequence[dict]] = None) -
             normalized = normalized[:-6]
         if normalized in SAMPLE_TYPE_TO_ID:
             return normalized
-    if annotations:
-        for annotation in annotations:
-            for key in ("sample_type", "sampleType", "type", "image_type"):
-                if key in annotation:
-                    normalized = normalize_sample_type(annotation[key], None)
-                    if normalized != UNKNOWN_SAMPLE_TYPE:
-                        return normalized
-            if annotation.get("is_hard_negative"):
-                return "HN"
     return UNKNOWN_SAMPLE_TYPE
 
 

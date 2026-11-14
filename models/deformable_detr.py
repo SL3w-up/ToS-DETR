@@ -38,9 +38,6 @@ STAGE_LOSSES = {
     'stage1_heatmap': ['heatmap'],
     'stage2_full': ['labels', 'boxes', 'centers', 'heatmap', 'region', 'query_coverage',
                     'slice_memory', 'consistency', 'contrastive', 'cardinality'],
-    'stage3_hard_negative': ['labels', 'boxes', 'centers', 'heatmap', 'region', 'query_coverage',
-                            'slice_memory', 'consistency', 'contrastive', 'hardneg', 'cardinality'],
-    'stage4_calibration': ['temperature_calibration', 'calibration', 'cardinality'],
 }
 
 
@@ -88,8 +85,6 @@ class DeformableDETR(nn.Module):
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.center_embed = MLP(hidden_dim, hidden_dim, 2, 3)
-        self.uncertainty_embed = MLP(hidden_dim, hidden_dim, 1, 3)
-        self.logit_temperature = nn.Parameter(torch.ones(1))
         self.num_feature_levels = num_feature_levels
         self.dynamic_queries = dynamic_queries and not two_stage
         self.organ_mask_input_strength = organ_mask_input_strength
@@ -147,8 +142,6 @@ class DeformableDETR(nn.Module):
         nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
         nn.init.constant_(self.center_embed.layers[-1].weight.data, 0)
         nn.init.constant_(self.center_embed.layers[-1].bias.data, 0)
-        nn.init.constant_(self.uncertainty_embed.layers[-1].weight.data, 0)
-        nn.init.constant_(self.uncertainty_embed.layers[-1].bias.data, 0)
         for proj in self.input_proj:
             nn.init.xavier_uniform_(proj[0].weight, gain=1)
             nn.init.constant_(proj[0].bias, 0)
@@ -159,7 +152,6 @@ class DeformableDETR(nn.Module):
             self.class_embed = _get_clones(self.class_embed, num_pred)
             self.bbox_embed = _get_clones(self.bbox_embed, num_pred)
             self.center_embed = _get_clones(self.center_embed, num_pred)
-            self.uncertainty_embed = _get_clones(self.uncertainty_embed, num_pred)
             nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
             self.transformer.decoder.bbox_embed = self.bbox_embed
         else:
@@ -167,7 +159,6 @@ class DeformableDETR(nn.Module):
             self.class_embed = nn.ModuleList([self.class_embed for _ in range(num_pred)])
             self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(num_pred)])
             self.center_embed = nn.ModuleList([self.center_embed for _ in range(num_pred)])
-            self.uncertainty_embed = nn.ModuleList([self.uncertainty_embed for _ in range(num_pred)])
             self.transformer.decoder.bbox_embed = None
         if two_stage:
             self.transformer.decoder.class_embed = self.class_embed
@@ -413,7 +404,6 @@ class DeformableDETR(nn.Module):
         outputs_classes = []
         outputs_coords = []
         outputs_centers = []
-        outputs_uncertainty = []
         for lvl in range(hs.shape[0]):
             if lvl == 0:
                 reference = init_reference
@@ -423,7 +413,6 @@ class DeformableDETR(nn.Module):
             outputs_class = self.class_embed[lvl](hs[lvl])
             tmp = self.bbox_embed[lvl](hs[lvl])
             center = self.center_embed[lvl](hs[lvl])
-            uncertainty = self.uncertainty_embed[lvl](hs[lvl])
             if reference.shape[-1] == 4:
                 tmp += reference
             else:
@@ -432,15 +421,12 @@ class DeformableDETR(nn.Module):
                 center += reference
             outputs_coord = tmp.sigmoid()
             outputs_center = center.sigmoid()
-            temperature = self.logit_temperature.clamp(min=0.05, max=10.0).to(outputs_class.dtype)
-            outputs_classes.append(outputs_class / temperature)
+            outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
             outputs_centers.append(outputs_center)
-            outputs_uncertainty.append(uncertainty)
         outputs_class = torch.stack(outputs_classes)
         outputs_coord = torch.stack(outputs_coords)
         outputs_center = torch.stack(outputs_centers)
-        outputs_uncertainty = torch.stack(outputs_uncertainty)
 
         pooled_slice_features = torch.stack([
             raw_samples_tensor[:, i].flatten(1).mean(dim=1) for i in range(raw_samples_tensor.shape[1])
@@ -449,7 +435,6 @@ class DeformableDETR(nn.Module):
             'pred_logits': outputs_class[-1],
             'pred_boxes': outputs_coord[-1],
             'pred_centers': outputs_center[-1],
-            'pred_uncertainty': outputs_uncertainty[-1],
             'fracture_heatmap': heatmap_logits,
             'edge_prior': edge_prior,
             'region_prior': region_prior,
@@ -458,14 +443,13 @@ class DeformableDETR(nn.Module):
             'query_peak_scores': query_peak_scores,
             'slice_features': pooled_slice_features,
             'query_features': hs[-1].mean(dim=1),
-            'logit_temperature': self.logit_temperature.clamp(min=0.05, max=10.0),
         }
         if region_level_priors:
             out['region_level_priors'] = region_level_priors
         out.update(slice_memory_stats)
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord,
-                                                    outputs_center, outputs_uncertainty)
+                                                    outputs_center)
 
         if self.two_stage:
             enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
@@ -473,13 +457,13 @@ class DeformableDETR(nn.Module):
         return out
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_center, outputs_uncertainty):
+    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_center):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_boxes': b, 'pred_centers': c, 'pred_uncertainty': d}
-                for a, b, c, d in zip(outputs_class[:-1], outputs_coord[:-1],
-                                      outputs_center[:-1], outputs_uncertainty[:-1])]
+        return [{'pred_logits': a, 'pred_boxes': b, 'pred_centers': c}
+                for a, b, c in zip(outputs_class[:-1], outputs_coord[:-1],
+                                   outputs_center[:-1])]
 
 
 class SetCriterion(nn.Module):
@@ -699,7 +683,7 @@ class SetCriterion(nn.Module):
         if query_features is None:
             return {'loss_contrastive': torch.tensor(0.0, device=outputs['pred_logits'].device)}
         sample_types = torch.stack([
-            t.get('sample_type_id', torch.tensor(3, device=query_features.device)).to(query_features.device).view(())
+            t.get('sample_type_id', torch.tensor(2, device=query_features.device)).to(query_features.device).view(())
             for t in targets
         ])
         # Case-aware contrastive objective: compare P/PN within the same case
@@ -721,68 +705,6 @@ class SetCriterion(nn.Module):
         if not losses:
             return {'loss_contrastive': query_features.sum() * 0.0}
         return {'loss_contrastive': torch.stack(losses).mean()}
-
-    def loss_hardneg(self, outputs, targets, indices, num_boxes):
-        sample_types = torch.stack([
-            t.get('sample_type_id', torch.tensor(3, device=outputs['pred_logits'].device)).to(outputs['pred_logits'].device).view(())
-            for t in targets
-        ])
-        hn_mask = sample_types == 2
-        if not hn_mask.any():
-            return {'loss_hardneg': outputs['pred_logits'].sum() * 0.0}
-        probs_per_query = outputs['pred_logits'].sigmoid().amax(dim=2)
-        region_prior = outputs.get('region_prior')
-        if region_prior is not None:
-            centers = outputs.get('pred_centers', outputs['pred_boxes'][..., :2]).clamp(0, 1)
-            region_values = sample_map_at_points(
-                region_prior.to(device=centers.device, dtype=centers.dtype), centers
-            ).clamp(0, 1)
-            probs_per_query = probs_per_query * region_values
-        probs = probs_per_query.amax(dim=1)
-        return {'loss_hardneg': probs[hn_mask].mean()}
-
-    def loss_calibration(self, outputs, targets, indices, num_boxes):
-        if 'pred_uncertainty' not in outputs:
-            return {'loss_calibration': outputs['pred_logits'].sum() * 0.0}
-        idx = self._get_src_permutation_idx(indices)
-        pred_boxes = outputs['pred_boxes'][idx]
-        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-        matched_uncertainty = outputs['pred_uncertainty'][idx]
-        if pred_boxes.numel() == 0 or target_boxes.numel() == 0:
-            return {'loss_calibration': outputs['pred_uncertainty'].sum() * 0.0}
-        giou = torch.diag(box_ops.generalized_box_iou(
-            box_ops.box_cxcywh_to_xyxy(pred_boxes),
-            box_ops.box_cxcywh_to_xyxy(target_boxes)))
-        target_uncertainty = (1.0 - giou).unsqueeze(-1).clamp(0.0, 1.0).detach()
-        return {'loss_calibration': F.smooth_l1_loss(matched_uncertainty.sigmoid(), target_uncertainty)}
-
-    def loss_temperature_calibration(self, outputs, targets, indices, num_boxes):
-        assert 'pred_logits' in outputs
-        src_logits = outputs['pred_logits']
-        idx = self._get_src_permutation_idx(indices)
-        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
-                                    dtype=torch.int64, device=src_logits.device)
-        if idx[0].numel() > 0:
-            target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-            target_classes[idx] = target_classes_o
-
-        target_onehot = torch.zeros(
-            [src_logits.shape[0], src_logits.shape[1], src_logits.shape[2] + 1],
-            dtype=src_logits.dtype,
-            device=src_logits.device,
-        )
-        target_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
-        target_onehot = target_onehot[:, :, :-1]
-        weights = torch.full_like(target_onehot, 0.05)
-        weights = torch.where(target_onehot > 0, torch.ones_like(weights), weights)
-        nll = F.binary_cross_entropy_with_logits(src_logits, target_onehot, reduction='none')
-        probs = src_logits.sigmoid()
-        brier = (probs - target_onehot).pow(2)
-        denom = weights.sum().clamp(min=1.0)
-        return {
-            'loss_temperature_nll': (nll * weights).sum() / denom,
-            'loss_temperature_brier': (brier * weights).sum() / denom,
-        }
 
     def loss_masks(self, outputs, targets, indices, num_boxes):
         """Compute the losses related to the masks: the focal loss and the dice loss.
@@ -834,9 +756,6 @@ class SetCriterion(nn.Module):
             'heatmap': self.loss_heatmap,
             'consistency': self.loss_consistency,
             'contrastive': self.loss_contrastive,
-            'hardneg': self.loss_hardneg,
-            'calibration': self.loss_calibration,
-            'temperature_calibration': self.loss_temperature_calibration,
             'region': self.loss_region,
             'query_coverage': self.loss_query_coverage,
             'slice_memory': self.loss_slice_memory,
@@ -861,7 +780,7 @@ class SetCriterion(nn.Module):
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs' and k != 'enc_outputs'}
 
         matching_losses = {'labels', 'boxes', 'centers', 'masks', 'cardinality',
-                           'calibration', 'temperature_calibration', 'region'}
+                           'region'}
         needs_matching = any(loss in matching_losses for loss in self.losses)
         # Retrieve the matching between the outputs of the last layer and the targets
         indices = self.matcher(outputs_without_aux, targets) if needs_matching else [
@@ -887,7 +806,7 @@ class SetCriterion(nn.Module):
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
                 indices = self.matcher(aux_outputs, targets)
                 for loss in active_losses:
-                    if loss in {'masks', 'heatmap', 'contrastive', 'hardneg', 'region', 'query_coverage', 'slice_memory'}:
+                    if loss in {'masks', 'heatmap', 'contrastive', 'region', 'query_coverage', 'slice_memory'}:
                         # Intermediate masks losses are too costly to compute, we ignore them.
                         continue
                     kwargs = {}
@@ -905,9 +824,8 @@ class SetCriterion(nn.Module):
                 bt['labels'] = torch.zeros_like(bt['labels'])
             indices = self.matcher(enc_outputs, bin_targets)
             for loss in active_losses:
-                if loss in {'masks', 'heatmap', 'consistency', 'contrastive', 'hardneg',
-                            'calibration', 'temperature_calibration', 'centers',
-                            'region', 'query_coverage', 'slice_memory'}:
+                if loss in {'masks', 'heatmap', 'consistency', 'contrastive',
+                            'centers', 'region', 'query_coverage', 'slice_memory'}:
                     # Intermediate masks losses are too costly to compute, we ignore them.
                     continue
                 kwargs = {}
@@ -935,7 +853,6 @@ class PostProcess(nn.Module):
         """
         out_logits, out_bbox = outputs['pred_logits'], outputs['pred_boxes']
         out_centers = outputs.get('pred_centers')
-        out_uncertainty = outputs.get('pred_uncertainty')
 
         assert len(out_logits) == len(target_sizes)
         assert target_sizes.shape[1] == 2
@@ -949,11 +866,8 @@ class PostProcess(nn.Module):
         boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
         boxes = torch.gather(boxes, 1, topk_boxes.unsqueeze(-1).repeat(1,1,4))
         centers = None
-        uncertainty = None
         if out_centers is not None:
             centers = torch.gather(out_centers, 1, topk_boxes.unsqueeze(-1).repeat(1, 1, 2))
-        if out_uncertainty is not None:
-            uncertainty = torch.gather(out_uncertainty.sigmoid(), 1, topk_boxes.unsqueeze(-1))
 
         # and from relative [0, 1] to absolute [0, height] coordinates
         img_h, img_w = target_sizes.unbind(1)
@@ -967,8 +881,6 @@ class PostProcess(nn.Module):
             result = {'scores': s, 'labels': l, 'boxes': b}
             if centers is not None:
                 result['centers'] = centers[idx]
-            if uncertainty is not None:
-                result['uncertainty'] = uncertainty[idx, :, 0]
             results.append(result)
 
         return results
@@ -987,7 +899,6 @@ class PostProcessFracture(nn.Module):
         case_beta=0.3,
         continuity_norm=5.0,
         organ_score_floor=0.05,
-        uncertainty_score_floor=0.5,
         max_detections_per_slice=20,
     ):
         super().__init__()
@@ -999,7 +910,6 @@ class PostProcessFracture(nn.Module):
         self.case_beta = case_beta
         self.continuity_norm = continuity_norm
         self.organ_score_floor = organ_score_floor
-        self.uncertainty_score_floor = uncertainty_score_floor
         self.max_detections_per_slice = max(int(max_detections_per_slice), 0)
         self.base = PostProcess()
 
@@ -1066,14 +976,6 @@ class PostProcessFracture(nn.Module):
             adjusted_scores = adjusted_scores * (
                 self.organ_score_floor + (1.0 - self.organ_score_floor) * organ_scores
             )
-        uncertainty = result.get("uncertainty")
-        if uncertainty is not None:
-            certainty = (1.0 - uncertainty).clamp(0, 1)
-            penalty = (uncertainty - 0.5).clamp(min=0, max=0.5) * 2.0
-            updated["certainty"] = certainty
-            adjusted_scores = adjusted_scores * (
-                1.0 - (1.0 - self.uncertainty_score_floor) * penalty
-            )
         if not updated:
             return result
         return {**result, **updated, "raw_scores": result["scores"], "scores": adjusted_scores}
@@ -1111,10 +1013,6 @@ class PostProcessFracture(nn.Module):
                     detection["center"] = result["centers"][det_idx].detach().cpu()
                 if "organ_scores" in result:
                     detection["organ_score"] = result["organ_scores"][det_idx].detach().cpu()
-                if "uncertainty" in result:
-                    detection["uncertainty"] = result["uncertainty"][det_idx].detach().cpu()
-                if "certainty" in result:
-                    detection["certainty"] = result["certainty"][det_idx].detach().cpu()
                 all_detections.append(detection)
             raw_detections = sorted(
                 all_detections,
@@ -1228,10 +1126,6 @@ def build(args):
     weight_dict['loss_heatmap'] = args.heatmap_loss_coef
     weight_dict['loss_consistency'] = args.consistency_loss_coef
     weight_dict['loss_contrastive'] = args.contrastive_loss_coef
-    weight_dict['loss_hardneg'] = args.hardneg_loss_coef
-    weight_dict['loss_calibration'] = args.calibration_loss_coef
-    weight_dict['loss_temperature_nll'] = args.calibration_loss_coef
-    weight_dict['loss_temperature_brier'] = args.calibration_loss_coef
     weight_dict['loss_region'] = args.region_loss_coef
     weight_dict['loss_query_coverage'] = args.query_coverage_loss_coef
     weight_dict['loss_slice_memory'] = args.slice_memory_loss_coef
@@ -1242,13 +1136,10 @@ def build(args):
         aux_weight_dict.update({k + f'_enc': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    initial_stage = args.training_stage
-    if initial_stage == 'auto_four_stage':
-        initial_stage = 'stage1_heatmap'
-    losses = get_stage_losses(initial_stage, include_masks=args.masks)
+    losses = get_stage_losses('stage1_heatmap', include_masks=args.masks)
     # num_classes, matcher, weight_dict, losses, focal_alpha=0.25
     criterion = SetCriterion(num_classes, matcher, weight_dict, losses,
-                             focal_alpha=args.focal_alpha, training_stage=initial_stage,
+                             focal_alpha=args.focal_alpha, training_stage='stage1_heatmap',
                              iou_loss_type=args.iou_loss_type,
                              heatmap_sigma=args.heatmap_sigma,
                              query_coverage_radius=args.query_coverage_radius)
@@ -1264,7 +1155,6 @@ def build(args):
             case_beta=args.case_beta,
             continuity_norm=args.case_continuity_norm,
             organ_score_floor=args.postprocess_organ_score_floor,
-            uncertainty_score_floor=args.postprocess_uncertainty_score_floor,
             max_detections_per_slice=args.fracture_max_detections_per_slice,
         ),
     }

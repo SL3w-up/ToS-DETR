@@ -24,7 +24,7 @@ import datasets
 import util.misc as utils
 import datasets.samplers as samplers
 from datasets import build_dataset, get_coco_api_from_dataset
-from engine import evaluate, mine_dynamic_hard_negatives, train_one_epoch
+from engine import evaluate, train_one_epoch
 from models import build_model
 
 
@@ -33,13 +33,12 @@ DEFAULT_PRETRAINED_MODEL = os.environ.get("TOS_DETR_PRETRAINED_MODEL", "")
 DEFAULT_BACKBONE_PRETRAINED = os.environ.get("TOS_DETR_BACKBONE_PRETRAINED", "")
 DEFAULT_COCO_PATH = os.environ.get("TOS_DETR_COCO_PATH", str(PROJECT_ROOT / "data" / "coco"))
 
-FOUR_STAGE_SCHEDULE = (
-    ('stage1_heatmap', 5),
-    ('stage2_full', 25),
-    ('stage3_hard_negative', 10),
-    ('stage4_calibration', 3),
-)
-FOUR_STAGE_TOTAL_EPOCHS = sum(length for _, length in FOUR_STAGE_SCHEDULE)
+# Reference schedule of the released checkpoint: 5-epoch heatmap warm-up followed
+# by full detector training under a 43-epoch cosine LR schedule (5 warmup epochs,
+# min_lr_factor 0.05). The best medical checkpoint was selected from this run by
+# the checkpoint-selection rule below; the schedule length itself is 43 epochs.
+TWO_STAGE_SCHEDULE_DEFAULT_STAGE1_EPOCHS = 5
+DEFAULT_TOTAL_EPOCHS = 43
 
 
 def load_checkpoint(checkpoint_path, allow_unsafe=False):
@@ -130,7 +129,9 @@ def build_lr_scheduler(optimizer, args):
         return torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
 
     warmup_epochs = max(int(args.warmup_epochs), 0)
-    total_epochs = max(int(args.epochs), 1)
+    # --cosine_horizon decouples the LR curve length from --epochs so partial
+    # runs still follow the reference 43-epoch cosine schedule.
+    total_epochs = max(int(args.cosine_horizon), 1)
     min_factor = float(args.min_lr_factor)
 
     def lr_lambda(epoch):
@@ -144,21 +145,12 @@ def build_lr_scheduler(optimizer, args):
 
 
 def get_epoch_training_stage(epoch, args):
-    if args.training_stage != 'auto_four_stage':
-        return args.training_stage
-    offset = 0
-    for stage, length in FOUR_STAGE_SCHEDULE:
-        if epoch < offset + length:
-            return stage
-        offset += length
-    return FOUR_STAGE_SCHEDULE[-1][0]
+    if epoch < args.stage1_epochs:
+        return 'stage1_heatmap'
+    return 'stage2_full'
 
 
 def get_stage_sample_type_ratios(stage, args):
-    if stage in ('stage3_hard_negative', 'stage4_calibration'):
-        return list(args.stage3_sample_type_ratios)
-    if stage in ('stage1_heatmap', 'stage2_full'):
-        return list(args.pre_hn_sample_type_ratios)
     return list(args.sample_type_ratios)
 
 
@@ -169,7 +161,7 @@ def _set_requires_grad_by_name(model, enabled_keywords, trainable=True):
 
 
 def configure_model_for_stage(model_without_ddp, criterion, optimizer, stage, args):
-    """Apply real stage behavior beyond just swapping the loss list."""
+    """Apply stage behavior: heatmap warm-up freezes everything but the heatmap path."""
     for parameter in model_without_ddp.parameters():
         parameter.requires_grad_(True)
 
@@ -186,16 +178,6 @@ def configure_model_for_stage(model_without_ddp, criterion, optimizer, stage, ar
             ],
             trainable=True,
         )
-    elif stage == 'stage4_calibration':
-        for parameter in model_without_ddp.parameters():
-            parameter.requires_grad_(False)
-        _set_requires_grad_by_name(
-            model_without_ddp,
-            ['logit_temperature', 'uncertainty_embed'],
-            trainable=True,
-        )
-    else:
-        _set_requires_grad_by_name(model_without_ddp, ['logit_temperature'], trainable=False)
 
     criterion.set_training_stage(stage, include_masks=args.masks)
 
@@ -248,7 +230,7 @@ def get_args_parser():
     parser.add_argument('--lr_linear_proj_mult', default=0.1, type=float)
     parser.add_argument('--batch_size', default=8, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
-    parser.add_argument('--epochs', default=FOUR_STAGE_TOTAL_EPOCHS, type=int)
+    parser.add_argument('--epochs', default=DEFAULT_TOTAL_EPOCHS, type=int)
     parser.add_argument('--lr_scheduler', default='cosine', choices=('cosine', 'step'),
                         help='Use warmup+cosine by default; step keeps the original Deformable DETR schedule')
     parser.add_argument('--warmup_epochs', default=5, type=int)
@@ -370,8 +352,6 @@ def get_args_parser():
                         help='Normalized radius within which at least one query should cover each GT center')
     parser.add_argument('--consistency_loss_coef', default=0.5, type=float)
     parser.add_argument('--contrastive_loss_coef', default=0.1, type=float)
-    parser.add_argument('--hardneg_loss_coef', default=0.5, type=float)
-    parser.add_argument('--calibration_loss_coef', default=0.5, type=float)
     parser.add_argument('--focal_alpha', default=0.25, type=float)
 
     # dataset parameters
@@ -419,11 +399,8 @@ def get_args_parser():
     parser.add_argument('--disable_mosaic', action='store_true', default=True)
     parser.add_argument('--disable_mixup', action='store_true', default=True)
     parser.add_argument('--disable_cutmix', action='store_true', default=True)
-    parser.add_argument('--sample_type_ratios', default=[0.35, 0.35, 0.20, 0.10], nargs=4, type=float)
-    parser.add_argument('--pre_hn_sample_type_ratios', default=[0.40, 0.40, 0.00, 0.20], nargs=4, type=float,
-                        help='P/PN/HN/N ratios before dynamic HN mining is active')
-    parser.add_argument('--stage3_sample_type_ratios', default=[0.35, 0.35, 0.20, 0.10], nargs=4, type=float,
-                        help='P/PN/HN/N ratios during hard-negative refinement')
+    parser.add_argument('--sample_type_ratios', default=[0.40, 0.40, 0.20], nargs=3, type=float,
+                        help='P/PN/N sampling ratios for case-aware slice sampling')
     parser.add_argument('--pn_slice_window', default=5, type=int,
                         help='Negative slices within this distance from a positive slice in the same case are PN-slices')
     parser.add_argument('--sample_type_sampling', dest='sample_type_sampling', action='store_true')
@@ -438,9 +415,11 @@ def get_args_parser():
                         help='Evaluate/test with each mini-batch containing sorted slices from one case only')
     parser.add_argument('--no_case_sequential_eval', dest='case_sequential_eval', action='store_false')
     parser.set_defaults(case_sequential_eval=True)
-    parser.add_argument('--training_stage', default='auto_four_stage', type=str,
-                        choices=['auto_four_stage', 'stage1_heatmap', 'stage2_full',
-                                 'stage3_hard_negative', 'stage4_calibration'])
+    parser.add_argument('--stage1_epochs', default=TWO_STAGE_SCHEDULE_DEFAULT_STAGE1_EPOCHS, type=int,
+                        help='Heatmap warm-up epochs before full detector training begins')
+    parser.add_argument('--cosine_horizon', default=DEFAULT_TOTAL_EPOCHS, type=int,
+                        help='Total epoch count used by the warmup+cosine LR schedule; '
+                             'decoupled from --epochs so partial runs follow the reference curve')
     parser.add_argument('--region_prior_weight', default=1.0, type=float,
                         help='organ-mask region prior embedding weight in the transformer encoder')
     parser.add_argument('--slice_memory_alpha', default=1.0, type=float,
@@ -456,7 +435,7 @@ def get_args_parser():
     parser.add_argument('--query_memory_gamma', dest='slice_memory_gamma', type=float,
                         help=argparse.SUPPRESS)
     parser.add_argument('--fracture_score_threshold', default=0.30, type=float,
-                        help='Slice detection score threshold for fracture metrics, HN mining, and case aggregation')
+                        help='Slice detection score threshold for fracture metrics and case aggregation')
     parser.add_argument('--case_association_iou', default=0.20, type=float,
                         help='IoU threshold for associating adjacent-slice boxes into one lesion track')
     parser.add_argument('--case_min_continuity', default=2, type=int,
@@ -471,8 +450,6 @@ def get_args_parser():
                         help='Threshold for case-level sensitivity/specificity and negative-case FP rate')
     parser.add_argument('--postprocess_organ_score_floor', default=0.05, type=float,
                         help='Minimum score multiplier for detections outside organ mask')
-    parser.add_argument('--postprocess_uncertainty_score_floor', default=0.5, type=float,
-                        help='Minimum score multiplier for high-uncertainty detections after calibration')
     parser.add_argument('--fracture_max_detections_per_slice', default=20, type=int,
                         help='Maximum thresholded fracture candidates kept per slice for lesion/FROC/case metrics; 0 keeps all')
     parser.add_argument('--froc_min_score', default=0.05, type=float,
@@ -510,17 +487,6 @@ def get_args_parser():
                         help='Recall metric maximized after the negative-case FP/case constraint is satisfied')
     parser.add_argument('--checkpoint_tie_eps', default=1e-6, type=float,
                         help='Tolerance for treating checkpoint recall values as tied before FP/FROC tie-breaks')
-    parser.add_argument('--dynamic_hn_mining', dest='dynamic_hn_mining', action='store_true')
-    parser.add_argument('--no_dynamic_hn_mining', dest='dynamic_hn_mining', action='store_false')
-    parser.set_defaults(dynamic_hn_mining=True)
-    parser.add_argument('--dynamic_hn_score_threshold', default=0.50, type=float,
-                        help='Minimum score for mining a negative slice as a dynamic hard negative')
-    parser.add_argument('--dynamic_hn_max_slices', default=5000, type=int,
-                        help='Maximum number of dynamic HN slices kept from one mining pass; 0 keeps all')
-    parser.add_argument('--dynamic_hn_mine_every', default=5, type=int,
-                        help='Run dynamic HN mining every N epochs after validation; 0 disables mining')
-    parser.add_argument('--dynamic_hn_batch_size', default=0, type=int,
-                        help='Batch size for dynamic HN mining; 0 reuses training batch size')
     parser.add_argument('--pretrained_model', default=DEFAULT_PRETRAINED_MODEL, type=str,
                         help='Optional checkpoint for shape-compatible warm start before training; unlike --resume it does not load optimizer state')
     parser.add_argument('--pretrained_include_keywords', default=['transformer'], type=str, nargs='+',
@@ -591,7 +557,6 @@ def main(args):
 
     dataset_train = build_dataset(image_set='train', args=args)
     dataset_val = build_dataset(image_set='val', args=args)
-    dataset_hn_mine = build_dataset(image_set='train_hn', args=args) if args.dynamic_hn_mining else None
 
     if args.distributed:
         if args.cache_mode:
@@ -613,7 +578,7 @@ def main(args):
         batch_sampler_train = samplers.CaseAwareSampleTypeBatchSampler(
             dataset_train,
             batch_size=args.batch_size,
-            ratios=get_stage_sample_type_ratios('stage1_heatmap' if args.training_stage == 'auto_four_stage' else args.training_stage, args),
+            ratios=get_stage_sample_type_ratios('stage2_full', args),
             neighbor_window=args.case_aware_neighbor_window,
             same_case_fraction=args.case_aware_same_case_fraction,
             drop_last=True,
@@ -625,7 +590,7 @@ def main(args):
         batch_sampler_train = samplers.SampleTypeBatchSampler(
             dataset_train,
             batch_size=args.batch_size,
-            ratios=get_stage_sample_type_ratios('stage1_heatmap' if args.training_stage == 'auto_four_stage' else args.training_stage, args),
+            ratios=get_stage_sample_type_ratios('stage2_full', args),
             drop_last=True,
             num_replicas=utils.get_world_size() if args.distributed else 1,
             rank=utils.get_rank() if args.distributed else 0,
@@ -653,17 +618,6 @@ def main(args):
         data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
                                      drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers,
                                      pin_memory=True)
-    data_loader_hn_mine = None
-    sampler_hn_mine = None
-    if dataset_hn_mine is not None:
-        if args.distributed:
-            sampler_hn_mine = samplers.DistributedSampler(dataset_hn_mine, shuffle=False)
-        else:
-            sampler_hn_mine = torch.utils.data.SequentialSampler(dataset_hn_mine)
-        hn_batch_size = args.dynamic_hn_batch_size if args.dynamic_hn_batch_size > 0 else args.batch_size
-        data_loader_hn_mine = DataLoader(dataset_hn_mine, hn_batch_size, sampler=sampler_hn_mine,
-                                         drop_last=False, collate_fn=utils.collate_fn,
-                                         num_workers=args.num_workers, pin_memory=True)
 
     # lr_backbone_names = ["backbone.0", "backbone.neck", "input_proj", "transformer.encoder"]
     def match_name_keywords(n, name_keywords):
@@ -765,8 +719,7 @@ def main(args):
             optimizer,
             get_epoch_training_stage(resume_stage_epoch, args),
             args,
-        )
-        # Optional resume validation is expensive because it runs COCO + medical
+        )        # Optional resume validation is expensive because it runs COCO + medical
         # fracture metrics before the next training log can be written.
         if not args.eval and args.validate_on_resume:
             test_stats, coco_evaluator = evaluate(
@@ -809,24 +762,6 @@ def main(args):
         if epoch_stage != current_stage:
             current_stage = epoch_stage
             stage_trainable_params = configure_model_for_stage(model_without_ddp, criterion, optimizer, current_stage, args)
-            if hasattr(batch_sampler_train, "set_ratios"):
-                batch_sampler_train.set_ratios(get_stage_sample_type_ratios(current_stage, args))
-            if (
-                current_stage == 'stage3_hard_negative'
-                and args.dynamic_hn_mining
-                and data_loader_hn_mine is not None
-                and hasattr(dataset_train, "update_dynamic_hard_negatives")
-            ):
-                if sampler_hn_mine is not None and hasattr(sampler_hn_mine, "set_epoch"):
-                    sampler_hn_mine.set_epoch(epoch)
-                hard_negative_ids, initial_hn_stats = mine_dynamic_hard_negatives(
-                    model, postprocessors, data_loader_hn_mine, device, args
-                )
-                applied = dataset_train.update_dynamic_hard_negatives(hard_negative_ids)
-                print(
-                    f"Initial stage3 dynamic HN mining: selected={len(hard_negative_ids)} "
-                    f"applied={applied} stats={initial_hn_stats}"
-                )
         if args.distributed and hasattr(sampler_train, "set_epoch"):
             sampler_train.set_epoch(epoch)
         if hasattr(batch_sampler_train, "set_epoch"):
@@ -985,29 +920,7 @@ def main(args):
                 best_fallback_froc,
             ), output_dir / 'checkpoint.pth')
 
-        hn_stats = {}
-        next_stage = get_epoch_training_stage(epoch + 1, args) if (epoch + 1) < args.epochs else None
-        should_mine_hn = (
-            args.dynamic_hn_mining
-            and data_loader_hn_mine is not None
-            and current_stage == 'stage3_hard_negative'
-            and next_stage == 'stage3_hard_negative'
-            and args.dynamic_hn_mine_every > 0
-            and (epoch + 1) % args.dynamic_hn_mine_every == 0
-        )
-        if should_mine_hn:
-            if sampler_hn_mine is not None and hasattr(sampler_hn_mine, "set_epoch"):
-                sampler_hn_mine.set_epoch(epoch)
-            hard_negative_ids, hn_stats = mine_dynamic_hard_negatives(
-                model, postprocessors, data_loader_hn_mine, device, args
-            )
-            if hasattr(dataset_train, "update_dynamic_hard_negatives"):
-                applied = dataset_train.update_dynamic_hard_negatives(hard_negative_ids)
-                hn_stats["dynamic_hn_applied_slices"] = float(applied)
-                print(f"Dynamic HN mining: selected={len(hard_negative_ids)} applied={applied}")
-
         log_stats.update({f'test_{k}': v for k, v in test_stats.items()})
-        log_stats.update({f'hn_{k}': v for k, v in hn_stats.items()})
         log_stats['log_phase'] = 'eval'
         log_stats['validation_pending'] = False
 

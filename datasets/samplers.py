@@ -215,7 +215,7 @@ class SampleTypeBatchSampler(Sampler):
 
 
 class CaseAwareSampleTypeBatchSampler(Sampler):
-    """Batch sampler that preserves P/PN/HN/N ratios while grouping nearby same-case slices."""
+    """Batch sampler that preserves P/PN/N ratios while grouping nearby same-case slices."""
 
     def __init__(self, dataset, batch_size, ratios, neighbor_window=5, same_case_fraction=0.5,
                  drop_last=True, num_replicas=1, rank=0, base_sampler=None):
@@ -344,7 +344,7 @@ class CaseAwareSampleTypeBatchSampler(Sampler):
                 neighbors.sort(key=lambda idx: abs(self.dataset.get_slice_index(idx) - anchor_slice)
                                if hasattr(self.dataset, "get_slice_index") else abs(idx - anchor))
                 preferred = []
-                for sample_type in ("PN", "P", "HN", "N"):
+                for sample_type in ("PN", "P", "N"):
                     preferred.extend([idx for idx in neighbors
                                       if self.dataset.get_sample_type(idx) == sample_type and idx not in preferred])
                 for neighbor in preferred:
@@ -398,7 +398,7 @@ class CaseAwareSampleTypeBatchSampler(Sampler):
 class CaseSequentialBatchSampler(Sampler):
     """Validation/test sampler that keeps each mini-batch inside a single case.
 
-    PN/HN/N/P are training-only sampling tags. Evaluation should follow the
+    PN/N/P are training-only sampling tags. Evaluation should follow the
     clinical unit instead: sorted slices from one case, split into fixed-size
     chunks only for memory control.
     """

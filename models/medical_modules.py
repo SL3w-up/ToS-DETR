@@ -3,18 +3,6 @@ import torch.nn.functional as F
 from torch import nn
 
 
-SAMPLE_TYPE_TO_ID = {
-    "P": 0,
-    "P-slice": 0,
-    "PN": 1,
-    "PN-slice": 1,
-    "HN": 2,
-    "HN-slice": 2,
-    "N": 3,
-    "N-slice": 3,
-}
-
-
 class ChannelWiseSliceEmbedding(nn.Module):
     """Adds learnable {-1, 0, +1} slice-position offsets to 2.5D input channels."""
 

@@ -1,6 +1,6 @@
 # Training
 
-This document describes the ToS-DETR training environment and four-stage training workflow.
+This document describes the ToS-DETR training environment and two-stage training workflow.
 
 ## Verified Environment
 
@@ -35,26 +35,25 @@ cd ../..
 
 `models/ops/make.sh` installs `MultiScaleDeformableAttention` into the active Python environment. Build it with the same Python executable used for training and inference.
 
-## Four-stage Training Schedule
+## Training Schedule
 
-Default training uses `--training_stage auto_four_stage` and runs these stages:
+Default training runs two stages under a 43-epoch warmup+cosine LR schedule (5 warmup epochs, `--min_lr_factor 0.05`):
 
 | Stage | Epochs | Purpose |
 | --- | ---: | --- |
-| `stage1_heatmap` | 5 | Warm up backbone, input projection, slice embedding, and fracture heatmap. |
-| `stage2_full` | 25 | Train full detector with box, center, heatmap, ROI, query coverage, slice memory, consistency, and contrastive losses. |
-| `stage3_hard_negative` | 10 | Add dynamic hard-negative mining and hard-negative suppression loss. |
-| `stage4_calibration` | 3 | Freeze the detector body and calibrate logit temperature/uncertainty. |
+| `stage1_heatmap` | 5 (`--stage1_epochs`) | Warm up backbone, input projection, slice embedding, and fracture heatmap. |
+| `stage2_full` | remaining epochs | Train the full detector with box, center, heatmap, ROI, query coverage, slice memory, consistency, and contrastive losses. |
+
+The released checkpoint was trained with the default settings: `--epochs 43 --warmup_epochs 5 --min_lr_factor 0.05`, with the best epoch selected by the medical checkpoint-selection rule below. `--cosine_horizon` (default 43) decouples the LR curve length from `--epochs`, so shorter runs still follow the reference LR schedule.
 
 ## Example Command
 
 ```bash
 python main.py \
   --coco_path /path/to/data/coco \
-  --output_dir outputs/tos_detr_four_stage \
+  --output_dir outputs/tos_detr \
   --backbone convnext_tiny \
   --num_feature_levels 3 \
-  --training_stage auto_four_stage \
   --batch_size 8 \
   --num_workers 2
 ```
@@ -62,9 +61,9 @@ python main.py \
 The convenience launcher applies the same ToS-DETR defaults and forwards additional arguments to `main.py`:
 
 ```bash
-configs/tos_detr_convnext_tiny_four_stage.sh \
+configs/tos_detr_convnext_tiny.sh \
   --coco_path /path/to/data/coco \
-  --output_dir outputs/tos_detr_four_stage
+  --output_dir outputs/tos_detr
 ```
 
 ## Warm-start Weights

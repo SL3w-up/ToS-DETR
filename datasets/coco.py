@@ -75,7 +75,6 @@ class CocoDetection(TvCocoDetection):
             has_boxes = self._has_valid_boxes(image_info, annotations)
             sample_type = normalize_sample_type(
                 image_info.get("sample_type") or image_info.get("sampleType") or image_info.get("type"),
-                annotations,
             )
             if has_boxes:
                 sample_type = "P"
@@ -92,8 +91,6 @@ class CocoDetection(TvCocoDetection):
                 )
                 sample_type = "PN" if is_near_positive else "N"
             self.sample_types.append(sample_type)
-        self.base_sample_types = list(self.sample_types)
-        self.dynamic_hn_image_ids = set()
         self.has_sample_types = len(self.sample_types) > 0
         self.case_to_indices = defaultdict(list)
         self.case_slice_to_index = {}
@@ -351,22 +348,6 @@ class CocoDetection(TvCocoDetection):
     def get_case_label(self, idx):
         return int(self.case_has_positive.get(self.get_case_id(idx), False))
 
-    def update_dynamic_hard_negatives(self, image_ids):
-        """Replace dynamic HN labels while preserving P-slices and static HN metadata."""
-        image_ids = {int(image_id) for image_id in image_ids}
-        self.dynamic_hn_image_ids = image_ids
-        changed = 0
-        for idx, image_id in enumerate(self.ids):
-            base_type = self.base_sample_types[idx]
-            if base_type == "P":
-                self.sample_types[idx] = base_type
-            elif int(image_id) in image_ids:
-                self.sample_types[idx] = "HN"
-            else:
-                self.sample_types[idx] = base_type
-            changed += int(self.sample_types[idx] != base_type)
-        return changed
-
     def __getitem__(self, idx):
         img, target = super(CocoDetection, self).__getitem__(idx)
         image_id = self.ids[idx]
@@ -520,7 +501,7 @@ def make_coco_transforms(image_set, args):
     if image_set == 'train':
         return T.Compose(train_transforms)
 
-    if image_set in ('val', 'train_hn'):
+    if image_set == 'val':
         return T.Compose([
             fixed_resize,
             normalize,
@@ -535,7 +516,6 @@ def build(image_set, args):
     mode = 'instances'
     PATHS = {
         "train": (root / "train2017", root / "annotations" / f'{mode}_train2017.json'),
-        "train_hn": (root / "train2017", root / "annotations" / f'{mode}_train2017.json'),
         "val": (root / "val2017", root / "annotations" / f'{mode}_val2017.json'),
     }
 
@@ -552,6 +532,6 @@ def build(image_set, args):
                             strict_organ_masks=args.strict_organ_masks,
                             organ_mask_missing_warning_limit=args.organ_mask_missing_warning_limit,
                             require_case_metadata=args.require_case_metadata,
-                            validate_organ_masks=args.strict_organ_masks and image_set != 'train_hn',
+                            validate_organ_masks=args.strict_organ_masks and image_set != 'train',
                             organ_mask_validate_max_samples=args.organ_mask_validate_max_samples)
     return dataset
